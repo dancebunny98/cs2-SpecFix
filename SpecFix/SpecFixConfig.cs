@@ -1,44 +1,27 @@
-using System.Text.Json.Serialization;
 using CounterStrikeSharp.API.Core;
 
 namespace SpecFix;
 
 public class SpecFixConfig : BasePluginConfig
 {
-    public override int Version { get; set; } = 4;
-
-    /// <summary>Master switch for the fix.</summary>
-    [JsonPropertyName("Enabled")]
+    // Главный выключатель всего плагина.
     public bool Enabled { get; set; } = true;
 
-    /// <summary>Print a debug line to server console whenever a phantom pawn is removed.</summary>
-    [JsonPropertyName("DebugLog")]
-    public bool DebugLog { get; set; } = true;
+    // Подробные логи в консоль сервера.
+    public bool DebugLog { get; set; } = false;
 
-    /// <summary>
-    /// When a player dies (or ends up in spectator/no-team with no clean
-    /// death), make sure their old body actually stops moving/shooting
-    /// and their camera is pointed at a live target instead of it.
-    /// </summary>
-    [JsonPropertyName("FixGhostOnDeath")]
+    // Лечение "призрака" при смерти и в спектаторах.
     public bool FixGhostOnDeath { get; set; } = true;
 
-    /// <summary>
-    /// Rate-limit jointeam so rapid T/CT/Spectator cycling can't trigger
-    /// the ghost state in the first place, on any team.
-    /// </summary>
-    [JsonPropertyName("RateLimitTeamSwitch")]
+    // Ограничение частоты смены команды.
     public bool RateLimitTeamSwitch { get; set; } = true;
 
-    /// <summary>How many jointeam calls are allowed within the sliding window before blocking.</summary>
-    [JsonPropertyName("MaxTeamSwitchesInWindow")]
+    // Скользящее окно (в секундах), в пределах которого считаются смены.
+    public float TeamSwitchWindowSeconds { get; set; } = 5.0f;
+
+    // Сколько смен команды допустимо в окне, прежде чем сработает блок.
     public int MaxTeamSwitchesInWindow { get; set; } = 3;
 
-    /// <summary>Sliding window (seconds) the switch count above is measured over.</summary>
-    [JsonPropertyName("TeamSwitchWindowSeconds")]
-    public float TeamSwitchWindowSeconds { get; set; } = 4.0f;
-
-    /// <summary>How long (seconds) a player is blocked from jointeam after tripping the limit.</summary>
-    [JsonPropertyName("TeamSwitchCooldownSeconds")]
-    public float TeamSwitchCooldownSeconds { get; set; } = 3.0f;
+    // Длительность кулдауна (в секундах) после срабатывания блока.
+    public float TeamSwitchCooldownSeconds { get; set; } = 10.0f;
 }
