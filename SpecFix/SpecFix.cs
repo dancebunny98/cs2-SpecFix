@@ -5,6 +5,7 @@ using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
 using CounterStrikeSharp.API.Modules.Admin;
 using CounterStrikeSharp.API.Modules.Commands;
+using CounterStrikeSharp.API.Modules.Listeners;
 using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
 
@@ -14,8 +15,8 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 {
     public override string ModuleName => "SpecFix";
     public override string ModuleAuthor => "Nip0s";
-    public override string ModuleVersion => "3.4.0";
-    public override string ModuleDescription => "Proactively controls the spectator switch cycle so the camera never lands on the phantom body.";
+    public override string ModuleVersion => "3.5.0";
+    public override string ModuleDescription => "Proactively controls the spectator switch cycle so the camera never lands on the phantom body, and makes sure a dead player's old body actually stops moving/shooting instead of becoming a ghost.";
 
     public SpecFixConfig Config { get; set; } = new();
     public void OnConfigParsed(SpecFixConfig config) => Config = config;
@@ -56,6 +57,25 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
         AddCommandListener("spec_next", OnSpecNext, HookMode.Pre);
         AddCommandListener("spec_prev", OnSpecPrev, HookMode.Pre);
         AddCommandListener("spec_mode", OnSpecMode, HookMode.Pre);
+
+        // GHOST FIX (death side of the same phantom-body problem).
+        //
+        // On a normal death, CS2 leaves the old CCSPlayerPawn behind instead
+        // of removing it - that's the "phantom" the spec_next/spec_prev code
+        // above avoids looking at. Separately, if a player is exploited or
+        // race-conditioned into spectator/dead state while that pawn is
+        // still fully alive (health > 0, LifeState == ALIVE), the pawn goes
+        // on being fully functional: it can still walk and shoot even
+        // though its owner is "dead". Two layers close this:
+        //
+        //   1. EventPlayerDeath: one frame after every death, make sure the
+        //      body actually stopped functioning, then point that player's
+        //      own camera at a live target instead of their own corpse.
+        //   2. A per-tick sweep as a safety net, for cases where a death
+        //      event doesn't fire cleanly (e.g. the same team-switch abuse
+        //      this plugin already guards spectating against).
+        RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
+        RegisterListener<Listeners.OnTick>(OnGameTick);
 
         Console.WriteLine($"[{ModuleName}] Loaded v{ModuleVersion} (Enabled={Config.Enabled})");
     }
@@ -183,6 +203,102 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 
         if (Config.DebugLog)
             Console.WriteLine($"[{ModuleName}] {controller.PlayerName} spec_mode landed on own body #{bodyIndex} -> rescued to live pawn #{next.Index}.");
+    }
+
+    private HookResult OnPlayerDeath(EventPlayerDeath @event, GameEventInfo info)
+    {
+        if (!Config.Enabled || !Config.FixGhostOnDeath)
+            return HookResult.Continue;
+
+        var victim = @event.Userid;
+        if (victim is null || !victim.IsValid || victim.IsHLTV)
+            return HookResult.Continue;
+
+        // Let the engine finish its own death processing (ragdoll, stats,
+        // freezecam target selection) for one frame first, then take over:
+        // confirm the body stopped functioning and move the camera off it.
+        Server.NextFrame(() => FixGhostBody(victim));
+
+        return HookResult.Continue;
+    }
+
+    // Per-tick safety net: catches a player sitting in spectator (or with
+    // no team) whose old PlayerPawn is still reporting alive/functional -
+    // the exact signature of the "dead but can walk and shoot" exploit,
+    // regardless of whether it was reached via death, team-switch abuse,
+    // or anything else.
+    private void OnGameTick()
+    {
+        if (!Config.Enabled || !Config.FixGhostOnDeath)
+            return;
+
+        foreach (var player in Utilities.GetPlayers())
+        {
+            if (player is null || !player.IsValid || player.IsHLTV)
+                continue;
+
+            bool notActivelyPlaying = player.Team is CsTeam.Spectator or CsTeam.None;
+            if (!notActivelyPlaying)
+                continue;
+
+            var pawn = player.PlayerPawn?.Value;
+            if (pawn is null || !pawn.IsValid)
+                continue;
+
+            bool pawnStillFunctional = pawn.Health > 0 && pawn.LifeState == LIFE_ALIVE;
+            if (!pawnStillFunctional)
+                continue;
+
+            var p = player;
+            Server.NextFrame(() => FixGhostBody(p));
+        }
+    }
+
+    private void FixGhostBody(CCSPlayerController controller)
+    {
+        if (!Config.Enabled || !Config.FixGhostOnDeath)
+            return;
+
+        if (controller is null || !controller.IsValid || controller.IsHLTV)
+            return;
+
+        var body = controller.PlayerPawn?.Value;
+
+        // If the old body is still alive and functional, actually kill it
+        // so it can no longer move or shoot - this is the core of the fix.
+        if (body is not null && body.IsValid && body.Health > 0 && body.LifeState == LIFE_ALIVE)
+        {
+            controller.CommitSuicide(false, true);
+
+            if (Config.DebugLog)
+                Console.WriteLine($"[{ModuleName}] {controller.PlayerName} had a functional body after death/spectate - forced to actually die.");
+        }
+
+        // Make sure this player is watching a live target, not sitting on
+        // (or drifting back onto) their own now-disabled body.
+        var observerPawn = controller.Pawn?.Value;
+        var obs = observerPawn?.ObserverServices;
+        if (observerPawn is null || !observerPawn.IsValid || obs is null)
+            return;
+
+        var targets = GetLiveTargetPawns();
+        if (targets.Count == 0)
+            return;
+
+        var currentTarget = obs.ObserverTarget?.Value;
+        bool alreadyOnLiveTarget = currentTarget is not null && currentTarget.IsValid
+            && targets.Any(t => t.Index == currentTarget.Index);
+        if (alreadyOnLiveTarget)
+            return; // engine already picked a real target (e.g. normal killcam) - leave it alone
+
+        var next = targets[0];
+
+        obs.ObserverTarget.Raw = next.EntityHandle.Raw;
+        obs.ObserverMode = OBS_MODE_IN_EYE;
+        Utilities.SetStateChanged(observerPawn, "CBasePlayerPawn", "m_pObserverServices");
+
+        if (Config.DebugLog)
+            Console.WriteLine($"[{ModuleName}] {controller.PlayerName} died -> camera moved to live pawn #{next.Index}.");
     }
 
     private static List<CCSPlayerPawn> GetLiveTargetPawns()

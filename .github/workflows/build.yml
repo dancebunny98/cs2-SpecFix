@@ -1,0 +1,75 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore SpecFix/SpecFix.csproj
+
+      - name: Build (Release)
+        run: dotnet build SpecFix/SpecFix.csproj -c Release --no-restore
+
+      - name: Upload build artifact (raw dll/pdb)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpecFix-build-${{ github.sha }}
+          path: |
+            SpecFix/bin/Release/net8.0/SpecFix.dll
+            SpecFix/bin/Release/net8.0/SpecFix.pdb
+          if-no-files-found: error
+
+      - name: Upload ready-to-upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpecFix-bundle-${{ github.sha }}
+          path: SpecFix/bin/Release/net8.0/bundle/**
+          if-no-files-found: error
+
+  # Attach the bundle as a zip to the GitHub Release when a v* tag is pushed.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore SpecFix/SpecFix.csproj
+
+      - name: Build (Release)
+        run: dotnet build SpecFix/SpecFix.csproj -c Release --no-restore
+
+      - name: Zip bundle
+        run: |
+          cd SpecFix/bin/Release/net8.0/bundle
+          zip -r "$GITHUB_WORKSPACE/SpecFix-${{ github.ref_name }}.zip" .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SpecFix-${{ github.ref_name }}.zip
