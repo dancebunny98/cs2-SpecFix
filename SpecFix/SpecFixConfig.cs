@@ -5,7 +5,7 @@ namespace SpecFix;
 
 public class SpecFixConfig : BasePluginConfig
 {
-    public override int Version { get; set; } = 3;
+    public override int Version { get; set; } = 4;
 
     /// <summary>Master switch for the fix.</summary>
     [JsonPropertyName("Enabled")]
@@ -22,4 +22,23 @@ public class SpecFixConfig : BasePluginConfig
     /// </summary>
     [JsonPropertyName("FixGhostOnDeath")]
     public bool FixGhostOnDeath { get; set; } = true;
+
+    /// <summary>
+    /// Rate-limit jointeam so rapid T/CT/Spectator cycling can't trigger
+    /// the ghost state in the first place, on any team.
+    /// </summary>
+    [JsonPropertyName("RateLimitTeamSwitch")]
+    public bool RateLimitTeamSwitch { get; set; } = true;
+
+    /// <summary>How many jointeam calls are allowed within the sliding window before blocking.</summary>
+    [JsonPropertyName("MaxTeamSwitchesInWindow")]
+    public int MaxTeamSwitchesInWindow { get; set; } = 3;
+
+    /// <summary>Sliding window (seconds) the switch count above is measured over.</summary>
+    [JsonPropertyName("TeamSwitchWindowSeconds")]
+    public float TeamSwitchWindowSeconds { get; set; } = 4.0f;
+
+    /// <summary>How long (seconds) a player is blocked from jointeam after tripping the limit.</summary>
+    [JsonPropertyName("TeamSwitchCooldownSeconds")]
+    public float TeamSwitchCooldownSeconds { get; set; } = 3.0f;
 }

@@ -15,8 +15,8 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 {
     public override string ModuleName => "SpecFix";
     public override string ModuleAuthor => "Nip0s";
-    public override string ModuleVersion => "3.5.0";
-    public override string ModuleDescription => "Proactively controls the spectator switch cycle so the camera never lands on the phantom body, and makes sure a dead player's old body actually stops moving/shooting instead of becoming a ghost.";
+    public override string ModuleVersion => "3.6.0";
+    public override string ModuleDescription => "Proactively controls the spectator switch cycle so the camera never lands on the phantom body, kills a dead player's still-functional body instead of letting it become a ghost, and rate-limits rapid team switching so the ghost state can't be triggered in the first place.";
 
     public SpecFixConfig Config { get; set; } = new();
     public void OnConfigParsed(SpecFixConfig config) => Config = config;
@@ -28,6 +28,11 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
     private const byte OBS_MODE_IN_EYE = 2;
 
     private const byte LIFE_ALIVE = 0;
+
+    // Per-player jointeam timestamps within the sliding window, and a
+    // cooldown deadline for anyone who tripped the rate limit.
+    private readonly Dictionary<ulong, List<float>> _switchTimestamps = new();
+    private readonly Dictionary<ulong, float> _switchBlockedUntil = new();
 
     public override void Load(bool hotReload)
     {
@@ -76,6 +81,27 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
         //      this plugin already guards spectating against).
         RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
         RegisterListener<Listeners.OnTick>(OnGameTick);
+
+        // RATE LIMIT (root-cause side of the same problem).
+        //
+        // The ghost state above is a symptom - the actual trigger is a
+        // player cycling jointeam (T <-> CT <-> Spectator) faster than the
+        // engine can fully process a spawn/despawn/team-change cycle. Once
+        // triggered, the resulting broken entity can end up on ANY team,
+        // not just Spectator - reacting to that after the fact isn't
+        // reliable. So instead of trying to detect every shape the ghost
+        // can take, we stop the trigger itself: too many jointeam calls in
+        // a short window gets the request blocked and the player forced
+        // into a clean, fully-reset Spectator state.
+        AddCommandListener("jointeam", OnJoinTeamCommand, HookMode.Pre);
+
+        RegisterEventHandler<EventPlayerDisconnect>((@event, info) =>
+        {
+            var sid = @event.Userid?.SteamID ?? 0;
+            _switchTimestamps.Remove(sid);
+            _switchBlockedUntil.Remove(sid);
+            return HookResult.Continue;
+        });
 
         Console.WriteLine($"[{ModuleName}] Loaded v{ModuleVersion} (Enabled={Config.Enabled})");
     }
@@ -299,6 +325,65 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 
         if (Config.DebugLog)
             Console.WriteLine($"[{ModuleName}] {controller.PlayerName} died -> camera moved to live pawn #{next.Index}.");
+    }
+
+    private HookResult OnJoinTeamCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (!Config.Enabled || !Config.RateLimitTeamSwitch)
+            return HookResult.Continue;
+
+        if (player is null || !player.IsValid || player.IsBot || player.IsHLTV)
+            return HookResult.Continue;
+
+        var steamId = player.SteamID;
+        var now = Server.CurrentTime;
+
+        // Already in cooldown from a previous violation -> block outright.
+        if (_switchBlockedUntil.TryGetValue(steamId, out var until) && now < until)
+            return HookResult.Stop;
+
+        if (!_switchTimestamps.TryGetValue(steamId, out var list))
+        {
+            list = new List<float>();
+            _switchTimestamps[steamId] = list;
+        }
+
+        // Drop timestamps outside the sliding window, record this attempt.
+        list.RemoveAll(t => now - t > Config.TeamSwitchWindowSeconds);
+        list.Add(now);
+
+        if (list.Count > Config.MaxTeamSwitchesInWindow)
+        {
+            _switchBlockedUntil[steamId] = now + Config.TeamSwitchCooldownSeconds;
+            list.Clear();
+
+            var p = player;
+            Server.NextFrame(() => ForceCleanReset(p));
+
+            if (Config.DebugLog)
+                Console.WriteLine($"[{ModuleName}] {player.PlayerName} switched teams too fast ({Config.MaxTeamSwitchesInWindow}+ in {Config.TeamSwitchWindowSeconds:0.#}s) - blocked and reset to Spectator.");
+
+            return HookResult.Stop;
+        }
+
+        return HookResult.Continue;
+    }
+
+    // Forces the player into a known-clean Spectator state: kill any live
+    // pawn outright, then move to Spectator. This is deliberately more
+    // aggressive than the death-side fix above - the whole point is to
+    // never let the in-flight team-switch sequence complete in a way that
+    // could leave a broken pawn behind on ANY team.
+    private void ForceCleanReset(CCSPlayerController controller)
+    {
+        if (controller is null || !controller.IsValid)
+            return;
+
+        var pawn = controller.PlayerPawn?.Value;
+        if (pawn is not null && pawn.IsValid && pawn.Health > 0)
+            controller.CommitSuicide(false, true);
+
+        controller.ChangeTeam(CsTeam.Spectator);
     }
 
     private static List<CCSPlayerPawn> GetLiveTargetPawns()
