@@ -15,7 +15,7 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 {
     public override string ModuleName => "SpecFix";
     public override string ModuleAuthor => "Nip0s";
-    public override string ModuleVersion => "3.6.0";
+    public override string ModuleVersion => "3.7.0";
     public override string ModuleDescription => "Proactively controls the spectator switch cycle so the camera never lands on the phantom body, kills a dead player's still-functional body instead of letting it become a ghost, and rate-limits rapid team switching so the ghost state can't be triggered in the first place.";
 
     public SpecFixConfig Config { get; set; } = new();
@@ -36,63 +36,17 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 
     public override void Load(bool hotReload)
     {
-        // VARIANT 1 (+ narrow variant-B safety net).
-        //
-        // Variant 3 proved the phantom IS the dead PlayerPawn that persists
-        // while the player sits in spectators; killing it does not remove it.
-        //
-        // spec_next / spec_prev  (proactive, NO flicker):
-        //   We take over the switch cycle. We pick the next/previous LIVE player
-        //   ourselves (never the phantom), set the observer target, and BLOCK the
-        //   original command so the engine never gets a chance to select the
-        //   phantom. This is the normal left/right click cycling.
-        //
-        // spec_mode  (reactive safety net, path B):
-        //   When you're free-roaming and click to lock onto a target, the engine
-        //   chooses the target you are AIMING at - geometry we cannot replicate
-        //   from managed code. So we DON'T block spec_mode (that would break
-        //   "lock onto who I'm looking at"). Instead we let it run, then one tick
-        //   later we check: if the engine happened to land the camera on our OWN
-        //   phantom body, we bump it to a live player. If it landed on a real
-        //   target, we leave it exactly as the engine chose.
-        //
-        // Fully crash-safe: no Remove(), no controller-handle swap, no player
-        // teleport. The observer sub-object is networked the CORRECT way, by
-        // marking the containing pointer dirty on CBasePlayerPawn.
         AddCommandListener("spec_next", OnSpecNext, HookMode.Pre);
         AddCommandListener("spec_prev", OnSpecPrev, HookMode.Pre);
         AddCommandListener("spec_mode", OnSpecMode, HookMode.Pre);
 
-        // GHOST FIX (death side of the same phantom-body problem).
-        //
-        // On a normal death, CS2 leaves the old CCSPlayerPawn behind instead
-        // of removing it - that's the "phantom" the spec_next/spec_prev code
-        // above avoids looking at. Separately, if a player is exploited or
-        // race-conditioned into spectator/dead state while that pawn is
-        // still fully alive (health > 0, LifeState == ALIVE), the pawn goes
-        // on being fully functional: it can still walk and shoot even
-        // though its owner is "dead". Two layers close this:
-        //
-        //   1. EventPlayerDeath: one frame after every death, make sure the
-        //      body actually stopped functioning, then point that player's
-        //      own camera at a live target instead of their own corpse.
-        //   2. A per-tick sweep as a safety net, for cases where a death
-        //      event doesn't fire cleanly (e.g. the same team-switch abuse
-        //      this plugin already guards spectating against).
         RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
         RegisterListener<Listeners.OnTick>(OnGameTick);
 
-        // RATE LIMIT (root-cause side of the same problem).
-        //
-        // The ghost state above is a symptom - the actual trigger is a
-        // player cycling jointeam (T <-> CT <-> Spectator) faster than the
-        // engine can fully process a spawn/despawn/team-change cycle. Once
-        // triggered, the resulting broken entity can end up on ANY team,
-        // not just Spectator - reacting to that after the fact isn't
-        // reliable. So instead of trying to detect every shape the ghost
-        // can take, we stop the trigger itself: too many jointeam calls in
-        // a short window gets the request blocked and the player forced
-        // into a clean, fully-reset Spectator state.
+        // НОВОЕ: срабатывает ПОСЛЕ смены команды — идеальный момент
+        // для зачистки фантомного pawn, оставшегося от старой команды.
+        RegisterEventHandler<EventPlayerTeam>(OnPlayerTeam);
+
         AddCommandListener("jointeam", OnJoinTeamCommand, HookMode.Pre);
 
         RegisterEventHandler<EventPlayerDisconnect>((@event, info) =>
@@ -120,7 +74,6 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
         if (player is null || !player.IsValid || player.IsHLTV)
             return HookResult.Continue;
 
-        // Only take over the cycle for players who are NOT actively playing.
         if (player.Team is CsTeam.Terrorist or CsTeam.CounterTerrorist)
             return HookResult.Continue;
 
@@ -129,12 +82,10 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
         if (observerPawn is null || !observerPawn.IsValid || obs is null)
             return HookResult.Continue;
 
-        // Build the ordered list of valid LIVE targets (never the phantom).
         var targets = GetLiveTargetPawns();
         if (targets.Count == 0)
-            return HookResult.Continue; // nobody to watch -> let engine decide
+            return HookResult.Continue;
 
-        // Where is the camera now?
         uint currentTargetIndex = 0;
         var currentTarget = obs.ObserverTarget?.Value;
         if (currentTarget is not null && currentTarget.IsValid)
@@ -142,10 +93,9 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 
         int currentPos = targets.FindIndex(p => p.Index == currentTargetIndex);
 
-        // Step to the next/previous live target (wrapping around).
         int nextPos;
         if (currentPos < 0)
-            nextPos = 0; // camera was on something invalid (e.g. phantom) -> first live
+            nextPos = 0;
         else
             nextPos = forward
                 ? (currentPos + 1) % targets.Count
@@ -155,19 +105,14 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 
         obs.ObserverTarget!.Raw = next.EntityHandle.Raw;
         obs.ObserverMode = OBS_MODE_IN_EYE;
-        // Correct way to network the embedded observer-services sub-object.
         Utilities.SetStateChanged(observerPawn, "CBasePlayerPawn", "m_pObserverServices");
 
         if (Config.DebugLog)
             Console.WriteLine($"[{ModuleName}] {player.PlayerName} spec {(forward ? "next" : "prev")} -> live pawn #{next.Index} (skipped engine cycle).");
 
-        // Block the engine's own switch so it can never select the phantom.
         return HookResult.Stop;
     }
 
-    // Path B: don't block spec_mode (engine keeps "lock onto who I'm aiming at"),
-    // but schedule a one-tick-later check to rescue the camera if it landed on
-    // our own phantom body.
     private HookResult OnSpecMode(CCSPlayerController? player, CommandInfo command)
     {
         if (!Config.Enabled)
@@ -179,7 +124,6 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
         if (player.Team is CsTeam.Terrorist or CsTeam.CounterTerrorist)
             return HookResult.Continue;
 
-        // Capture the controller; re-validate inside the delayed callback.
         var controller = player;
         AddTimer(0.03f, () => RescueFromPhantom(controller));
 
@@ -197,7 +141,6 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
         if (controller.Team is CsTeam.Terrorist or CsTeam.CounterTerrorist)
             return;
 
-        // The phantom is this spectator's own leftover T/CT body.
         var body = controller.PlayerPawn?.Value;
         if (body is null || !body.IsValid)
             return;
@@ -211,11 +154,10 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
         if (observerPawn is null || !observerPawn.IsValid || obs is null)
             return;
 
-        // Only rescue if the engine actually landed the camera on our own body.
         var target = obs.ObserverTarget?.Value;
         bool stuckOnOwnBody = target is not null && target.IsValid && target.Index == bodyIndex;
         if (!stuckOnOwnBody)
-            return; // engine picked a real target -> leave the player's choice alone
+            return;
 
         var targets = GetLiveTargetPawns();
         if (targets.Count == 0)
@@ -240,19 +182,65 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
         if (victim is null || !victim.IsValid || victim.IsHLTV)
             return HookResult.Continue;
 
-        // Let the engine finish its own death processing (ragdoll, stats,
-        // freezecam target selection) for one frame first, then take over:
-        // confirm the body stopped functioning and move the camera off it.
         Server.NextFrame(() => FixGhostBody(victim));
 
         return HookResult.Continue;
     }
 
-    // Per-tick safety net: catches a player sitting in spectator (or with
-    // no team) whose old PlayerPawn is still reporting alive/functional -
-    // the exact signature of the "dead but can walk and shoot" exploit,
-    // regardless of whether it was reached via death, team-switch abuse,
-    // or anything else.
+    // НОВОЕ: реакция на фактическую смену команды. Здесь игрок уже в новой
+    // команде, но старый pawn может продолжать существовать как "призрак".
+    private HookResult OnPlayerTeam(EventPlayerTeam @event, GameEventInfo info)
+    {
+        if (!Config.Enabled || !Config.FixGhostOnDeath)
+            return HookResult.Continue;
+
+        var player = @event.Userid;
+        if (player is null || !player.IsValid || player.IsHLTV || player.IsBot)
+            return HookResult.Continue;
+
+        var p = player;
+        Server.NextFrame(() => CleanupGhostPawn(p));
+
+        return HookResult.Continue;
+    }
+
+    // НОВОЕ: мягкая зачистка. Если игрок уже не в T/CT, а его pawn
+    // всё ещё "жив" — это фантом. Удаляем сущность физически.
+    private void CleanupGhostPawn(CCSPlayerController controller)
+    {
+        if (!Config.Enabled || !Config.FixGhostOnDeath)
+            return;
+
+        if (controller is null || !controller.IsValid || controller.IsHLTV)
+            return;
+
+        // Если игрок УЖЕ в T/CT — это его нормальное активное тело.
+        // Трогать нельзя ни в коем случае.
+        if (controller.Team is CsTeam.Terrorist or CsTeam.CounterTerrorist)
+            return;
+
+        var pawn = controller.PlayerPawn?.Value;
+        if (pawn is null || !pawn.IsValid)
+            return;
+
+        // Фантом = "живой" pawn у игрока вне активной игры.
+        bool pawnStillFunctional = pawn.Health > 0 && pawn.LifeState == LIFE_ALIVE;
+        if (!pawnStillFunctional)
+            return;
+
+        try
+        {
+            pawn.Remove();
+
+            if (Config.DebugLog)
+                Console.WriteLine($"[{ModuleName}] Removed phantom pawn of {controller.PlayerName} after team change.");
+        }
+        catch (System.Exception ex)
+        {
+            Console.WriteLine($"[{ModuleName}] Failed to remove phantom pawn for {controller.PlayerName}: {ex.Message}");
+        }
+    }
+
     private void OnGameTick()
     {
         if (!Config.Enabled || !Config.FixGhostOnDeath)
@@ -290,8 +278,6 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 
         var body = controller.PlayerPawn?.Value;
 
-        // If the old body is still alive and functional, actually kill it
-        // so it can no longer move or shoot - this is the core of the fix.
         if (body is not null && body.IsValid && body.Health > 0 && body.LifeState == LIFE_ALIVE)
         {
             controller.CommitSuicide(false, true);
@@ -300,8 +286,6 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
                 Console.WriteLine($"[{ModuleName}] {controller.PlayerName} had a functional body after death/spectate - forced to actually die.");
         }
 
-        // Make sure this player is watching a live target, not sitting on
-        // (or drifting back onto) their own now-disabled body.
         var observerPawn = controller.Pawn?.Value;
         var obs = observerPawn?.ObserverServices;
         if (observerPawn is null || !observerPawn.IsValid || obs is null)
@@ -315,7 +299,7 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
         bool alreadyOnLiveTarget = currentTarget is not null && currentTarget.IsValid
             && targets.Any(t => t.Index == currentTarget.Index);
         if (alreadyOnLiveTarget)
-            return; // engine already picked a real target (e.g. normal killcam) - leave it alone
+            return;
 
         var next = targets[0];
 
@@ -338,7 +322,6 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
         var steamId = player.SteamID;
         var now = Server.CurrentTime;
 
-        // Already in cooldown from a previous violation -> block outright.
         if (_switchBlockedUntil.TryGetValue(steamId, out var until) && now < until)
             return HookResult.Stop;
 
@@ -348,7 +331,6 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
             _switchTimestamps[steamId] = list;
         }
 
-        // Drop timestamps outside the sliding window, record this attempt.
         list.RemoveAll(t => now - t > Config.TeamSwitchWindowSeconds);
         list.Add(now);
 
@@ -366,14 +348,14 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
             return HookResult.Stop;
         }
 
+        // НОВОЕ: даже когда смена разрешена, после её выполнения
+        // запускаем зачистку — на случай, если движок оставит старый pawn.
+        var pAllowed = player;
+        Server.NextFrame(() => CleanupGhostPawn(pAllowed));
+
         return HookResult.Continue;
     }
 
-    // Forces the player into a known-clean Spectator state: kill any live
-    // pawn outright, then move to Spectator. This is deliberately more
-    // aggressive than the death-side fix above - the whole point is to
-    // never let the in-flight team-switch sequence complete in a way that
-    // could leave a broken pawn behind on ANY team.
     private void ForceCleanReset(CCSPlayerController controller)
     {
         if (controller is null || !controller.IsValid)
