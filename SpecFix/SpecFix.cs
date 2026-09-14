@@ -153,7 +153,7 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 
         var next = targets[nextPos];
 
-        obs.ObserverTarget.Raw = next.EntityHandle.Raw;
+        obs.ObserverTarget!.Raw = next.EntityHandle.Raw;
         obs.ObserverMode = OBS_MODE_IN_EYE;
         // Correct way to network the embedded observer-services sub-object.
         Utilities.SetStateChanged(observerPawn, "CBasePlayerPawn", "m_pObserverServices");
@@ -223,7 +223,7 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 
         var next = targets[0];
 
-        obs.ObserverTarget.Raw = next.EntityHandle.Raw;
+        obs.ObserverTarget!.Raw = next.EntityHandle.Raw;
         obs.ObserverMode = OBS_MODE_IN_EYE;
         Utilities.SetStateChanged(observerPawn, "CBasePlayerPawn", "m_pObserverServices");
 
@@ -319,7 +319,7 @@ public class SpecFix : BasePlugin, IPluginConfig<SpecFixConfig>
 
         var next = targets[0];
 
-        obs.ObserverTarget.Raw = next.EntityHandle.Raw;
+        obs.ObserverTarget!.Raw = next.EntityHandle.Raw;
         obs.ObserverMode = OBS_MODE_IN_EYE;
         Utilities.SetStateChanged(observerPawn, "CBasePlayerPawn", "m_pObserverServices");
 
