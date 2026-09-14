@@ -53,7 +53,7 @@
 dotnet build -c Release
 ```
 
-Готовый бандл: `bin/Release/net8.0/bundle/`.
+Готовый бандл: `bin/Release/net10.0/bundle/`.
 
 CI (`.github/workflows/build.yml`) собирает плагин на каждый push/PR в `main`, кладёт `.dll`/`.pdb` и готовый бандл в артефакты сборки. При пуше тега `v*` (например `v3.5.0`) дополнительно зипует бандл и прикладывает его к GitHub Release.
 
